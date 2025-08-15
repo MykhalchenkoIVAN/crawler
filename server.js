@@ -57,28 +57,16 @@ async function render(url) {
 function extractMain(html, url) {
   const $ = cheerio.load(html);
 
-  // Прибрати зайве
-  $("script,style,nav,header,footer,iframe,svg").remove();
+  // Прибираємо лише очевидне сміття
+  $("script,style,iframe,svg").remove();
 
-  // Спроби знайти основний контент
-  const candidates = [
-    "main", "article", ".theme-doc-markdown", ".docMainContainer",
-    "[data-docs-root]", "#__next", "#app", "[role='main']"
-  ];
-  let node = null;
-  for (const sel of candidates) {
-    const el = $(sel);
-    if (el.length && el.text().trim().length > 200) { node = el.first(); break; }
-  }
-  if (!node) node = $.root();
-
-  // Заголовок
+  // Беремо увесь видимий текст сторінки
   const title = ($("title").first().text() || url).trim();
+  const text = $.root().text().replace(/\s+/g, " ").trim();
 
-  // Текст з базовими розділами
-  const text = node.text().replace(/\s+/g, " ").trim();
   return { text, title, section: "" };
 }
+
 
 /** Косинусна схожість */
 function cosine(a, b) {
