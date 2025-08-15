@@ -2,25 +2,33 @@ import express from "express";
 import bodyParser from "body-parser";
 import fetch from "node-fetch";
 import { chromium } from "playwright";
+import * as cheerio from "cheerio";
+import OpenAI from "openai";
 
 const app = express();
 app.use(bodyParser.json());
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || "";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY; // ДОДАЙ у Railway
+const EMB_MODEL = process.env.EMB_MODEL || "text-embedding-3-small";
 
-const store = new Map(); // namespace -> [{text,url,title,section}]
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+
+/** Пам'ять: namespace -> [{text,url,title,section,embedding:number[]}] */
+const store = new Map();
 
 function auth(req, res, next) {
   if (!API_KEY) return next();
   const h = req.headers.authorization || "";
   if (h === `Bearer ${API_KEY}`) return next();
-  res.status(401).json({ ok: false, error: "Unauthorized" });
+  res.status(401).json({ ok:false, error:"Unauthorized" });
 }
 
 function chunk(text, size = 1000, overlap = 150) {
   const out = [];
-  for (let i = 0; i < text.length; i += (size - overlap)) out.push(text.slice(i, i + size));
+  for (let i = 0; i < text.length; i += (size - overlap))
+    out.push(text.slice(i, i + size));
   return out;
 }
 
@@ -39,27 +47,63 @@ async function getUrlsFromSitemap(root) {
 async function render(url) {
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   const page = await browser.newPage();
-  await page.goto(url, { waitUntil: "networkidle", timeout: 60000 });
+  await page.goto(url, { waitUntil: "networkidle", timeout: 90000 });
   const html = await page.content();
   await browser.close();
   return html;
 }
 
+/** Видобуваємо МАКСИМУМ корисного тексту зі SPA */
 function extractMain(html, url) {
-  const title = (html.match(/<title>(.*?)<\/title>/i)||[])[1] || url;
-  const cleaned = html
-    .replace(/<script[\s\S]*?<\/script>/g,"")
-    .replace(/<style[\s\S]*?<\/style>/g,"")
-    .replace(/<nav[\s\S]*?<\/nav>/g,"")
-    .replace(/<header[\s\S]*?<\/header>/g,"")
-    .replace(/<footer[\s\S]*?<\/footer>/g,"")
-    .replace(/<[^>]+>/g," ")
-    .replace(/\s+/g," ")
-    .trim();
-  return { text: cleaned, title, section: "" };
+  const $ = cheerio.load(html);
+
+  // Прибрати зайве
+  $("script,style,nav,header,footer,iframe,svg").remove();
+
+  // Спроби знайти основний контент
+  const candidates = [
+    "main", "article", ".theme-doc-markdown", ".docMainContainer",
+    "[data-docs-root]", "#__next", "#app", "[role='main']"
+  ];
+  let node = null;
+  for (const sel of candidates) {
+    const el = $(sel);
+    if (el.length && el.text().trim().length > 200) { node = el.first(); break; }
+  }
+  if (!node) node = $.root();
+
+  // Заголовок
+  const title = ($("title").first().text() || url).trim();
+
+  // Текст з базовими розділами
+  const text = node.text().replace(/\s+/g, " ").trim();
+  return { text, title, section: "" };
+}
+
+/** Косинусна схожість */
+function cosine(a, b) {
+  let dot=0, na=0, nb=0;
+  for (let i=0;i<a.length;i++){ dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; }
+  return dot / (Math.sqrt(na)*Math.sqrt(nb) + 1e-9);
+}
+
+/** Отримати ембеддинги */
+async function embedBatch(texts) {
+  if (!openai) throw new Error("OPENAI_API_KEY is not set");
+  const resp = await openai.embeddings.create({
+    model: EMB_MODEL,
+    input: texts
+  });
+  return resp.data.map(d => d.embedding);
 }
 
 app.get("/health", (_,res)=>res.send("ok"));
+
+/** Скільки чанків у namespace */
+app.get("/debug/count", (req,res)=>{
+  const ns = req.query.namespace || "default";
+  res.json({ namespace: ns, chunks: (store.get(ns)||[]).length });
+});
 
 app.post("/ingest", auth, async (req, res) => {
   const { url, allowlist = [url], maxDepth = 2, namespace = "default" } = req.body || {};
@@ -71,7 +115,15 @@ app.post("/ingest", auth, async (req, res) => {
       if (!allowlist.some(a => u.startsWith(a))) continue;
       const html = await render(u);
       const { text, title, section } = extractMain(html, u);
-      for (const c of chunk(text)) docs.push({ text:c, url:u, title, section });
+      const chunks = chunk(text);
+      // Ембеддинги пакетами (по 64)
+      for (let i=0;i<chunks.length;i+=64){
+        const slice = chunks.slice(i, i+64);
+        const embs = await embedBatch(slice);
+        for (let j=0;j<slice.length;j++){
+          docs.push({ text: slice[j], url: u, title, section, embedding: embs[j] });
+        }
+      }
     }
     store.set(namespace, (store.get(namespace)||[]).concat(docs));
     res.json({ ok:true, namespace, pages: urls.length, chunks: docs.length });
@@ -83,14 +135,32 @@ app.post("/ingest", auth, async (req, res) => {
 app.post("/search", auth, async (req, res) => {
   const { query, top_k = 5, namespace = "default" } = req.body || {};
   if (!query) return res.status(400).json({ ok:false, error:"query required" });
+
   const corpus = store.get(namespace) || [];
-  const q = query.toLowerCase();
-  const hits = corpus
-    .map(r => ({ r, score: r.text.toLowerCase().includes(q) ? 1 : 0 }))
-    .filter(x => x.score > 0)
+  if (corpus.length === 0) return res.json({ hits: [] });
+
+  // Embed запит
+  let qEmb;
+  try {
+    qEmb = (await embedBatch([query]))[0];
+  } catch (e) {
+    return res.status(500).json({ ok:false, error:"embedding_failed: "+String(e) });
+  }
+
+  // Рейтинг
+  const scored = corpus
+    .map(r => ({ r, score: cosine(qEmb, r.embedding) }))
+    .sort((a,b)=>b.score-a.score)
     .slice(0, top_k)
-    .map(x => ({ text:x.r.text.slice(0, 900), url:x.r.url, title:x.r.title, section:x.r.section }));
-  res.json({ hits });
+    .map(x => ({
+      text: x.r.text.slice(0, 900),
+      url: x.r.url,
+      title: x.r.title,
+      section: x.r.section,
+      score: x.score
+    }));
+
+  res.json({ hits: scored });
 });
 
-app.listen(PORT, ()=>console.log(`DocRAG on :${PORT}`));
+app.listen(PORT, ()=>console.l
