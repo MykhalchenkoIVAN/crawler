@@ -1,0 +1,5 @@
+{
+  "build": { "builder": "DOCKERFILE" },
+  "deploy": { "numReplicas": 1, "startCommand": "npm start", "healthcheckPath": "/health" },
+  "variables": { "PORT": "3000" }
+}
